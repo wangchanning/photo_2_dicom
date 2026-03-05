@@ -10,6 +10,8 @@ import photo2dicom
 import setting
 import tools
 from log_config import log
+import signal
+import sys
 
 
 # 全局退出事件
@@ -56,12 +58,20 @@ def producer():
 
 
 def consumer():
-    while not shutdown_event.is_set():
+    while True:
         try:
             # 使用 timeout 让队列获取可中断
             pat_info_tup = q.get(timeout=1)
         except Empty:
+            if shutdown_event.is_set():
+                break
             continue
+        
+        # 检查是否为退出哨兵（None）
+        if pat_info_tup is None:
+            q.task_done()
+            log.info("消费者收到退出信号，正在退出...")
+            break
             
         sleep(random.random())
     
@@ -83,13 +93,31 @@ def consumer():
 
         if q.empty():
             print('当前任务队列为空，正在等待下发任务。。。\r', end='')
-    
-    log.info("消费者线程正在退出...")
 
 
 def signal_handler(signum, frame):
     log.warning('收到退出信号，正在关闭程序...')
     shutdown_event.set()
+    
+    # 清空队列中的所有待处理任务
+    cleared_count = 0
+    while not q.empty():
+        try:
+            q.get_nowait()
+            q.task_done()
+            cleared_count += 1
+        except Empty:
+            break
+    
+    if cleared_count > 0:
+        log.warning(f'已清空队列中的 {cleared_count} 个待处理任务')
+    
+    # 注入退出哨兵（使用 None 作为哨兵值）
+    try:
+        q.put_nowait(None)
+        log.info('退出信号已注入队列')
+    except:
+        log.warning('队列已满，无法注入退出信号')
 
 
 q = Queue(maxsize=50)
@@ -99,8 +127,6 @@ todicom = photo2dicom.Photo2Dicom(oracle_conn, setting)
 
 
 if __name__ == '__main__':
-    import signal
-    import sys
 
     # 跨平台注册信号
     if sys.platform == "win32":
@@ -126,14 +152,15 @@ if __name__ == '__main__':
 
     log.info('任务监听已启动...')
 
-    # 主线程：等待退出信号（通过 shutdown_event）
+    # 主线程：等待退出信号
     try:
-        while not shutdown_event.is_set():
-            cons_thread.join(timeout=2)
+        shutdown_event.wait()
     except KeyboardInterrupt:
-        shutdown_event.set()
+        log.warning('收到键盘中断信号...')
+        signal_handler(signal.SIGINT, None)
 
-    cons_thread.join(timeout=3)
+    # 等待消费者线程完成当前任务
+    cons_thread.join()
 
     log.warning('程序正在退出。。。')
     sleep(2)
