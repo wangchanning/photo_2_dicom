@@ -22,6 +22,9 @@ def producer():
         task_sql = f"SELECT bindingID, exam_no, patientName,patientAge,sex,time,modify_flag,studyUid FROM EXAM.GNK_EQUIP_BIND_PATIENT WHERE (EXAMTIME >= TO_DATE('{first_day}', 'YYYY-MM-DD')  AND  studyUid IS NULL) OR (EXAMTIME >= TO_DATE('{first_day}', 'YYYY-MM-DD') AND modify_flag = '1')"
         results = oracle_conn.execute_query(task_sql)
         for result in results:
+            if shutdown_event.is_set():
+                break
+                
             if result[-2] == '1' and result[-1] is None:
                 update_modify_flag_sql = f"UPDATE EXAM.GNK_EQUIP_BIND_PATIENT SET modify_flag = NULL WHERE bindingID = '{result[0]}'"
                 oracle_conn.execute_update(update_modify_flag_sql)
@@ -48,22 +51,19 @@ def producer():
                     except:
                         pass
 
-        # 可中断的 sleep
-        for _ in range(10):
-            if shutdown_event.is_set():
-                break
-            sleep(1)
+        # 使用 Event.wait() 实现可中断的 sleep
+        shutdown_event.wait(timeout=10)
 
 
 def consumer():
-    while True:
+    while not shutdown_event.is_set():
+        try:
+            # 使用 timeout 让队列获取可中断
+            pat_info_tup = q.get(timeout=1)
+        except Empty:
+            continue
+            
         sleep(random.random())
-        pat_info_tup = q.get(block=True)
-
-        if pat_info_tup == "quit":
-            q.task_done()
-            log.info("消费者收到退出信号，正在退出...")
-            return
     
         studyUid, modify_flag = (pat_info_tup[8], pat_info_tup[6])
         
@@ -83,26 +83,13 @@ def consumer():
 
         if q.empty():
             print('当前任务队列为空，正在等待下发任务。。。\r', end='')
+    
+    log.info("消费者线程正在退出...")
 
 
 def signal_handler(signum, frame):
     log.warning('收到退出信号，正在关闭程序...')
-    shutdown_event.set()  # 触发退出事件
-
-    # 清空队列（丢弃所有待处理任务）
-    while not q.empty():
-        try:
-            q.get_nowait()
-        except Empty:
-            break
-
-    # 注入退出哨兵
-    try:
-        q.put_nowait("quit")
-    except:
-        pass  # 如果队列满（理论上不会，刚清空），忽略
-
-    log.warning('退出哨兵已注入，消费者将尽快退出。')
+    shutdown_event.set()
 
 
 q = Queue(maxsize=50)
